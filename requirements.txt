@@ -1,5 +1,4 @@
 Flask
 requests
 pymongo
-apscheduler
 gunicorn
