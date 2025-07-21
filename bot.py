@@ -2,11 +2,12 @@ import os
 import sys
 import re
 import requests
+import json
 from flask import Flask, render_template_string, request, redirect, url_for, Response, jsonify
 from pymongo import MongoClient
 from bson.objectid import ObjectId
 from functools import wraps
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone # <--- এখানে timezone যোগ করা হয়েছে
 from apscheduler.schedulers.background import BackgroundScheduler
 
 # ======================================================================
@@ -24,6 +25,8 @@ ADMIN_USER_IDS = [uid.strip() for uid in ADMIN_USER_IDS_STR.split(',')] if ADMIN
 MAIN_CHANNEL_LINK = os.environ.get("MAIN_CHANNEL_LINK")
 UPDATE_CHANNEL_LINK = os.environ.get("UPDATE_CHANNEL_LINK")
 DEVELOPER_USER_LINK = os.environ.get("DEVELOPER_USER_LINK")
+PUBLIC_CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL_ID")
+WEBSITE_URL = os.environ.get("WEBSITE_URL")
 
 required_vars = {
     "MONGO_URI": MONGO_URI, "BOT_TOKEN": BOT_TOKEN, "TMDB_API_KEY": TMDB_API_KEY,
@@ -33,6 +36,8 @@ required_vars = {
     "MAIN_CHANNEL_LINK": MAIN_CHANNEL_LINK,
     "UPDATE_CHANNEL_LINK": UPDATE_CHANNEL_LINK,
     "DEVELOPER_USER_LINK": DEVELOPER_USER_LINK,
+    "PUBLIC_CHANNEL_ID": PUBLIC_CHANNEL_ID,
+    "WEBSITE_URL": WEBSITE_URL,
 }
 missing_vars = [name for name, value in required_vars.items() if not value]
 if missing_vars:
@@ -92,7 +97,8 @@ scheduler.start()
 
 def escape_markdown(text: str) -> str:
     if not isinstance(text, str): return ''
-    return re.sub(f'([{re.escape(r"_*[]()~`>#+-=|{}.!")}])', r'\\\1', text)
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
 
 def parse_links_from_string(link_string: str) -> list:
     if not link_string or not link_string.strip(): return []
@@ -108,6 +114,68 @@ def parse_links_from_string(link_string: str) -> list:
         else:
             links.append({'lang': 'Link', 'url': part})
     return links
+
+# ======================================================================
+# --- উন্নত ফাংশন: পাবলিক চ্যানেলে পোস্ট করার জন্য ---
+# ======================================================================
+def post_to_public_channel(content_id, post_type='content', season_num=None):
+    if not PUBLIC_CHANNEL_ID or not WEBSITE_URL:
+        print("WARNING: PUBLIC_CHANNEL_ID or WEBSITE_URL is not set. Skipping public post.")
+        return
+
+    try:
+        content = movies.find_one({"_id": ObjectId(content_id)})
+        if not content:
+            print(f"ERROR: Could not find content with ID {content_id} to post.")
+            return
+
+        title = content.get('title', 'No Title')
+        poster_url = content.get('poster')
+        escaped_title = escape_markdown(title)
+        
+        caption = ""
+        if post_type == 'season_pack' and season_num:
+            pack = next((p for p in content.get('season_packs', []) if p['season'] == season_num), None)
+            pack_langs = set()
+            if pack:
+                for link in pack.get('watch_links', []) + pack.get('download_links', []):
+                    pack_langs.add(link.get('lang', 'N/A'))
+            languages = ", ".join(sorted(list(pack_langs))) or "Not Specified"
+            escaped_langs = escape_markdown(languages)
+
+            caption = (
+                f"🎬 *{escaped_title}*\n\n"
+                f"🔥 *Season {season_num} Pack Added*\n\n"
+                f"🗣️ *ভাষা:* {escaped_langs}"
+            )
+        else:
+            languages = ", ".join(content.get('languages', [])) or "Not Specified"
+            escaped_langs = escape_markdown(languages)
+            caption = (
+                f"🎬 *{escaped_title}*\n\n"
+                f"🗣️ *ভাষা:* {escaped_langs}"
+            )
+
+        with app.app_context():
+            website_link = f"{WEBSITE_URL.rstrip('/')}{url_for('movie_detail', movie_id=str(content_id))}"
+        
+        keyboard = { "inline_keyboard": [[{"text": "🌐 ওয়েবসাইটে দেখুন (Watch on Website)", "url": website_link}]] }
+
+        if poster_url:
+            payload = {'chat_id': PUBLIC_CHANNEL_ID, 'photo': poster_url, 'caption': caption, 'parse_mode': 'MarkdownV2', 'reply_markup': json.dumps(keyboard)}
+            response = requests.post(f"{TELEGRAM_API_URL}/sendPhoto", json=payload)
+        else:
+            payload = {'chat_id': PUBLIC_CHANNEL_ID, 'text': caption, 'parse_mode': 'MarkdownV2', 'reply_markup': json.dumps(keyboard)}
+            response = requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload)
+
+        if response.status_code == 200:
+            print(f"SUCCESS: Successfully posted '{title}' (Type: {post_type}) to public channel.")
+        else:
+            print(f"ERROR: Failed to post to public channel. Status: {response.status_code}, Response: {response.text}")
+
+    except Exception as e:
+        print(f"FATAL ERROR in post_to_public_channel: {e}")
+
 
 # ======================================================================
 # --- HTML টেমপ্লেট ---
@@ -827,7 +895,11 @@ def admin():
             doc_data['files'] = [{"quality": q, "message_id": int(mid)} for q, mid in zip(request.form.getlist('telegram_quality[]'), request.form.getlist('telegram_message_id[]')) if q and mid]
         else: # Series
             doc_data["episodes"] = [{"season": int(s), "episode_number": int(e), "title": t, "watch_links": parse_links_from_string(wl), "download_links": parse_links_from_string(dl), "message_id": int(m) if m else None} for s, e, t, wl, dl, m in zip(request.form.getlist('episode_season[]'), request.form.getlist('episode_number[]'), request.form.getlist('episode_title[]'), request.form.getlist('episode_watch_links_str[]'), request.form.getlist('episode_download_links_str[]'), request.form.getlist('episode_message_id[]'))]
-        movies.insert_one(doc_data)
+        
+        result = movies.insert_one(doc_data)
+        if result.inserted_id:
+            post_to_public_channel(result.inserted_id, post_type='content')
+
         return redirect(url_for('admin'))
 
     search_query = request.args.get('search', '').strip()
@@ -904,7 +976,14 @@ def delete_all_movies():
 @app.route('/contact', methods=['GET', 'POST'])
 def contact():
     if request.method == 'POST':
-        feedback_data = { "type": request.form.get("type"), "content_title": request.form.get("content_title"), "message": request.form.get("message"), "email": request.form.get("email", "").strip(), "reported_content_id": request.form.get("reported_content_id"), "timestamp": datetime.utcnow() }
+        feedback_data = {
+            "type": request.form.get("type"), 
+            "content_title": request.form.get("content_title"), 
+            "message": request.form.get("message"), 
+            "email": request.form.get("email", "").strip(), 
+            "reported_content_id": request.form.get("reported_content_id"), 
+            "timestamp": datetime.now(timezone.utc) # <--- আপডেট করা হয়েছে
+        }
         feedback.insert_one(feedback_data)
         return render_template_string(contact_html, message_sent=True)
     prefill_title, prefill_id = request.args.get('title', ''), request.args.get('report_id', '')
@@ -926,7 +1005,6 @@ def telegram_webhook():
     data = request.get_json()
 
     if 'channel_post' in data:
-        # This part for automatic posting from channel remains unchanged.
         pass
 
     elif 'message' in data:
@@ -934,7 +1012,6 @@ def telegram_webhook():
         chat_id = message['chat']['id']
         text = message.get('text', '').strip()
         
-        # --- Start Command Logic for All Users (Deep Linking) ---
         if text.startswith('/start'):
             payload_str = text.split(' ', 1)[-1]
             if payload_str != '/start':
@@ -976,7 +1053,6 @@ def telegram_webhook():
             
             return jsonify(status='ok')
 
-        # --- Admin-only commands ---
         if str(chat_id) not in ADMIN_USER_IDS:
             return jsonify(status='ok')
         
@@ -1000,8 +1076,13 @@ def telegram_webhook():
                     requests.get(f"{TELEGRAM_API_URL}/sendMessage", params={'chat_id': chat_id, 'text': f"❌ দুঃখিত, '{title_part}' নামে কোনো মুভি পাওয়া যায়নি।"})
                     return jsonify(status='ok')
 
-                movie_doc = {**tmdb_data, "type": "movie", "poster_badge": badge, "watch_links": parse_links_from_string(watch_links_str), "download_links": parse_links_from_string(download_links_str), "created_at": datetime.utcnow()}
-                movies.update_one({"tmdb_id": tmdb_data["tmdb_id"]}, {"$set": movie_doc}, upsert=True)
+                movie_doc = {**tmdb_data, "type": "movie", "poster_badge": badge, "watch_links": parse_links_from_string(watch_links_str), "download_links": parse_links_from_string(download_links_str), "created_at": datetime.now(timezone.utc)} # <--- আপডেট করা হয়েছে
+                
+                result = movies.update_one({"tmdb_id": tmdb_data["tmdb_id"]}, {"$set": movie_doc}, upsert=True)
+                
+                if result.upserted_id:
+                    post_to_public_channel(result.upserted_id, post_type='content')
+                
                 requests.get(f"{TELEGRAM_API_URL}/sendMessage", params={'chat_id': chat_id, 'text': f"✅ সফলভাবে `{tmdb_data['title']}` মুভিটি ওয়েবসাইটে যোগ করা হয়েছে।", 'parse_mode': 'Markdown'})
             except Exception as e:
                 print(f"Error in /add command: {e}")
@@ -1028,8 +1109,13 @@ def telegram_webhook():
                     requests.get(f"{TELEGRAM_API_URL}/sendMessage", params={'chat_id': chat_id, 'text': f"❌ দুঃখিত, '{title_part}' নামে কোনো ওয়েব সিরিজ পাওয়া যায়নি।"})
                     return jsonify(status='ok')
 
-                series_doc = {**tmdb_data, "type": "series", "poster_badge": badge, "episodes": [], "season_packs": [], "created_at": datetime.utcnow()}
-                movies.update_one({"tmdb_id": tmdb_data["tmdb_id"]}, {"$set": series_doc}, upsert=True)
+                series_doc = {**tmdb_data, "type": "series", "poster_badge": badge, "episodes": [], "season_packs": [], "created_at": datetime.now(timezone.utc)} # <--- আপডেট করা হয়েছে
+                
+                result = movies.update_one({"tmdb_id": tmdb_data["tmdb_id"]}, {"$set": series_doc}, upsert=True)
+
+                if result.upserted_id:
+                    post_to_public_channel(result.upserted_id, post_type='content')
+
                 reply_text = f"✅ সফলভাবে `{tmdb_data['title']}` সিরিজটি যোগ করা হয়েছে।\n\n**এখন `/addepisode` বা `/addseasonpack` কমান্ড দিয়ে এপিসোড/সিজন যোগ করুন।**"
                 requests.get(f"{TELEGRAM_API_URL}/sendMessage", params={'chat_id': chat_id, 'text': reply_text, 'parse_mode': 'Markdown'})
             except:
@@ -1065,9 +1151,10 @@ def telegram_webhook():
 
                 existing_series = movies.find_one({"tmdb_id": tmdb_data["tmdb_id"]})
                 if not existing_series:
-                    series_doc = {**tmdb_data, "type": "series", "poster_badge": badge, "episodes": [], "season_packs": [], "created_at": datetime.utcnow()}
+                    series_doc = {**tmdb_data, "type": "series", "poster_badge": badge, "episodes": [], "season_packs": [], "created_at": datetime.now(timezone.utc)} # <--- আপডেট করা হয়েছে
                     result = movies.insert_one(series_doc)
                     series_id = result.inserted_id
+                    post_to_public_channel(series_id, post_type='content')
                     requests.get(f"{TELEGRAM_API_URL}/sendMessage", params={'chat_id': chat_id, 'text': f"ℹ️ নতুন সিরিজ `{tmdb_data['title']}` তৈরি করা হয়েছে। এখন এপিসোড যোগ করা হচ্ছে...", 'parse_mode': 'Markdown'})
                 else:
                     series_id = existing_series['_id']
@@ -1123,7 +1210,9 @@ def telegram_webhook():
                 if badge and badge not in series.get('languages', []):
                     movies.update_one({"_id": series['_id']}, {"$addToSet": {"languages": badge}})
                 
-                requests.get(f"{TELEGRAM_API_URL}/sendMessage", params={'chat_id': chat_id, 'text': f"✅ সফলভাবে `{series['title']}` সিরিজের সিজন {season_num} প্যাক (লিঙ্কসহ) যোগ করা হয়েছে।", 'parse_mode': 'Markdown'})
+                post_to_public_channel(series['_id'], post_type='season_pack', season_num=season_num)
+
+                requests.get(f"{TELEGRAM_API_URL}/sendMessage", params={'chat_id': chat_id, 'text': f"✅ সফলভাবে `{series['title']}` সিরিজের সিজন {season_num} প্যাক যোগ করা হয়েছে এবং চ্যানেলে পোস্ট করা হয়েছে।", 'parse_mode': 'Markdown'})
 
             except Exception as e:
                 print(f"Error in /addseasonpack command: {e}")
